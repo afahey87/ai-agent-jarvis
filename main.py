@@ -16,8 +16,9 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
-from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_core.output_parsers import JsonOutputParser
+from langchain.agents.factory import create_agent
+from langchain_core.messages import HumanMessage
 from tools import search_tool, wiki_tool, save_tool
 
 # Load environment variables from .env (e.g. API keys)
@@ -36,55 +37,53 @@ class ResearchResponse(BaseModel):
 # Initialize LLM client (make sure your environment provides needed API keys)
 llm = ChatGroq(model="llama-3.1-8b-instant")
 
-# Parser that will convert model output into the `ResearchResponse` model
-parser = PydanticOutputParser(pydantic_object=ResearchResponse)
+# Parser for converting JSON output to Pydantic model
+parser = JsonOutputParser(pydantic_object=ResearchResponse)
 
 
-# Build the prompt template; include format instructions for the parser
-prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            """
-            You are a research assistant that will help generate a research paper.
-            Answer the user query and use neccessary tools. 
-            Wrap the output in this format and provide no other text\n{format_instructions}
-            """,
-        ),
-        ("placeholder", "{chat_history}"),
-        ("human", "{query}"),
-        ("placeholder", "{agent_scratchpad}"),
-    ]
-).partial(format_instructions=parser.get_format_instructions())
+# Build the prompt template for tool-calling agents
+system_prompt = """You are a research assistant that helps generate research papers.
+Answer the user query and use necessary tools to gather information.
+Format your final response as a JSON object with this structure:
+{{
+    "topic": "the research topic",
+    "summary": "a comprehensive summary of findings",
+    "sources": ["list", "of", "sources"],
+    "tools_used": ["list", "of", "tools", "used"]
+}}
+Provide only valid JSON, no additional text."""
 
 
-# Register tools and create the agent that can call them
+# Register tools and create the agent
 tools = [search_tool, wiki_tool, save_tool]
-agent = create_tool_calling_agent(
-    llm=llm,
-    prompt=prompt,
-    tools=tools,
-)
-
-
-# Executor runs the agent loop; verbose=True prints tool calls
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+agent = create_agent(model=llm, tools=tools, system_prompt=system_prompt)
 
 
 def main():
     """Prompt the user, invoke the agent, and parse the structured response."""
 
     query = input("What can I help you research? ")
-    raw_response = agent_executor.invoke({"query": query})
-    print("Raw agent response:\n", raw_response)
-
+    
     try:
-        # Many agent runtimes return a list-of-messages inside `output`; extract safely
-        structured_response = parser.parse(raw_response.get("output")[0]["text"])
-        print("Parsed response:\n", structured_response)
+        # Invoke the agent with the query
+        response = agent.invoke({"messages": [HumanMessage(content=query)]})
+        print("\n=== Agent Execution Complete ===")
+        output = response["messages"][-1].content
+        print("Raw agent output:\n", output)
+        
+        # Parse the structured response
+        if output:
+            parsed_dict = parser.parse(output)
+            structured_response = ResearchResponse(**parsed_dict)
+            print("\n=== Parsed Response ===")
+            print(f"Topic: {structured_response.topic}")
+            print(f"Summary: {structured_response.summary}")
+            print(f"Sources: {structured_response.sources}")
+            print(f"Tools Used: {structured_response.tools_used}")
     except Exception as e:
-        # If parsing fails, print the error and raw response for debugging
-        print("Error parsing response", e, "Raw Response - ", raw_response)
+        print(f"Error during execution or parsing: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
